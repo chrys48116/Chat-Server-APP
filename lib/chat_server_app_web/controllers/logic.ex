@@ -1,90 +1,109 @@
 defmodule ChatServer.Logic do
 
-  #alias ChatServer.Messages
+  import Ecto.Query
 
-  def user_exists(user_id_from, user_id_to, state) do
-    case {Map.get(state.users, user_id_from), Map.get(state.users, user_id_to)} do
+  alias ChatServerApp.Repo
+  alias ChatServerApp.Models.Rooms.Schema.{Room, UserRoom}
+  alias ChatServerApp.Models.Users.Schema.User
+  alias ChatServerApp.Models.Messages.Schema.{GroupMessage, Message, PendingMessages}
+  def get() do
+    # Repo.all(User)
+    # Repo.all(Room)
+    # Repo.all(UserRoom)
+    # Repo.all(GroupMessage)
+    # Repo.all(Message)
+    Repo.all(PendingMessages)
+  end
+
+  def user_exists(user_id_from, user_id_to) do
+    case {Repo.one(from u in User, where: u.id == ^user_id_from), Repo.one(from u in User, where: u.id == ^user_id_to)} do
       {nil, _} ->  {:error, "User with id #{user_id_from} not found"}
       {_, nil} ->  {:error, "User with id #{user_id_to} not found"}
       {_, _} -> {:ok}
     end
   end
 
-  def join_room(user_id, room_name, state) do
-    case Map.get(state.rooms, room_name) do
-      nil ->
-        {:error, "Room does not exists", state}
+  def create_room(room_name) do
+    Repo.insert(Room.changeset(%Room{}, %{room_name: room_name}))
+    {:ok, "Room #{room_name} created"}
+  end
 
-      room_users ->
-        username = Map.get(state.users, user_id, "Unknown")
-        rooms = Map.put(state.rooms, room_name, [%{user_id: user_id, username: username} | room_users])
-        {:ok, "User #{username} joined #{room_name}", %{state | rooms: rooms}}
+  def join_room(user_id, room_id) do
+    case Repo.get(Room, room_id) do
+      nil ->
+        {:error, "Room does not exists"}
+
+      _ ->
+        username = Repo.one(
+          from u in User,
+          select: u.username,
+          where: u.id == ^user_id
+          )
+        room_name = Repo.one(
+          from r in Room,
+          select: r.room_name,
+          where: r.id == ^room_id
+        )
+
+        Repo.insert(UserRoom.changeset(%UserRoom{}, %{user: user_id, room: room_id}))
+        {:ok, "User #{username} joined in #{room_name}"}
     end
   end
 
-  def send_group_message(room_name, user_id_from, content, state) do
-    case Map.get(state.rooms, room_name) do
+  def send_group_message(room_id, user_id, content, content_type) do
+    case Repo.get(Room, room_id) do
       nil ->
-        {:error, "Room does not exist.", state}
+        {:error, "Room does not exists"}
 
-      room_users ->
-        new_message = %{user_id_from: user_id_from, content: content, room: room_name, timestamp: DateTime.utc_now()}
-        room_messages = Map.get(state.room_messages, room_name, [])
-        new_state = %{state | room_messages: Map.put(state.room_messages, room_name, [new_message | room_messages])}
-
-        # Notify all users in the room about the new message
-        response = Enum.reduce(room_users, "", fn %{user_id: _user_id, username: username}, acc ->
-          acc <> "Message sent of #{username}: #{content}"
-        end)
-        {:ok, response, new_state}
+      _ ->
+        username = Repo.one(from u in User, select: u.username, where: u.id == ^user_id)
+        Repo.insert(GroupMessage.changeset(%GroupMessage{}, %{user_id: user_id, content: content, content_type: content_type, room_id: room_id, timestamp: DateTime.utc_now()}))
+        {:ok, "Message sent of #{username}: #{content}"}
     end
   end
 
-  def send_message(user_id_from, user_id_to, content, state) do
-    case user_exists(user_id_from, user_id_to, state) do
-      {:error, error} ->
-        IO.puts(error)
-        {:error, "User not exists", state}
+  def send_message(user_id_from, user_id_to, content, content_type) do
+    case user_exists(user_id_from, user_id_to) do
+      {:error, response} ->
+        {:error, response}
 
       {:ok} ->
-        new_message = %{user_id_from: user_id_from, user_id_to: user_id_to, content: content, timestamp: DateTime.utc_now()}
-        state_message = %{state | messages: [new_message | state.messages]}
-        new_state = %{state_message | pending_messages: [new_message | state.pending_messages]}
-
-        # Notify the user that a new message has been sent
-        {:ok, "Message sent to User #{Map.get(state.users, user_id_to)}: #{content}", new_state}
+        username = Repo.one(from u in User, select: u.username, where: u.id == ^user_id_to)
+        Repo.insert(Message.changeset(%Message{}, %{user_id_from: user_id_from, user_id_to: user_id_to, content: content, content_type: content_type, timestamp: DateTime.utc_now()}))
+        Repo.insert(PendingMessages.changeset(%PendingMessages{}, %{user_id_from: user_id_from, user_id_to: user_id_to, content: content, content_type: content_type, timestamp: DateTime.utc_now()}))
+        {:ok, "Message sent to User #{username}: #{content}"}
     end
   end
 
-  def receive_messages(room_name, state) do
-    messages =
-    Map.get(state.room_messages, room_name, %{})
-    response = Enum.reduce(messages, "", fn message, acc ->
-      acc <> "Received message from #{Map.get(state.users, message.user_id_from)} at #{message.timestamp}: #{message.content}"
+  def receive_messages(room_id) do
+    messages = Repo.all(from m in GroupMessage,
+          join: u in assoc(m, :user),
+          where: m.room_id == ^room_id,
+          order_by: [desc: m.inserted_at],
+          select: %{content: m.content, timestamp: m.inserted_at, user_id: u.id})
+
+    response = Enum.reduce(messages, [], fn message, acc ->
+      ["Received message from #{message.user_id} at #{message.timestamp}: #{message.content}" | acc]
     end)
-    new_state = %{state | room_messages: messages}
-    {:ok, response, new_state}
+    {:ok, response}
   end
 
-  def get_pending_messages(user_id, state) do
-    {messages_to_user, remaining_messages} =
-      Enum.split_with(state.pending_messages, fn message ->
-        message.user_id_to == user_id
-      end)
-    response = Enum.reduce(messages_to_user, "", fn message, acc ->
-      acc <> "Received message from #{Map.get(state.users, message.user_id_from)} at #{message.timestamp}: #{message.content}"
+  def get_pending_messages(user_id) do
+    messages = Repo.all(from m in PendingMessages,
+          where: m.user_id_to == ^user_id,
+          order_by: [desc: :inserted_at],
+          select: %{content: m.content, timestamp: m.inserted_at, user_id_from: m.user_id_from})
+
+    response = Enum.reduce(messages, [], fn message, acc ->
+      ["Received message from #{message.user_id_from} at #{message.timestamp}: #{message.content}" | acc]
     end)
-    new_state = %{state | pending_messages: remaining_messages}
-    {:ok, response, new_state}
+
+    Repo.delete_all(from m in PendingMessages, where: m.user_id_to == ^user_id)
+    {:ok, response}
   end
 
-  def add_user(user_id, username, state) do
-    users = Map.put(state.users, user_id, username)
-    {:ok, "User created", %{state | users: users}}
-  end
+  def add_user(username), do: Repo.insert(User.changeset(%User{}, %{username: username}))
 
-  def remove_user(user_id, state) do
-    users = Map.delete(state.users, user_id)
-    {:ok, "User deleted", %{state | users: users}}
-  end
+  def remove_user(user_id), do: Repo.delete_by(User, [user_id: user_id])
+
 end
